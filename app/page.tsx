@@ -1,395 +1,440 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+/**
+ * Multiplayer Meme Face Match — Main Page
+ *
+ * Flow:
+ *  idle       → user sees landing, clicks Matchmake
+ *  queued     → waiting for opponent
+ *  in_room    → WebRTC video + game rounds
+ *  results    → scores shown, rematch / new match options
+ */
 
-declare global {
-  interface Window {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    faceapi: any;
-  }
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useSignaling } from "@/hooks/useSignaling";
+import { useWebRTC } from "@/hooks/useWebRTC";
+import { useFaceDetection, computeRatios, ratioSimilarity, FaceRatios } from "@/hooks/useFaceDetection";
+
+const WORKER_URL = process.env.NEXT_PUBLIC_WORKER_URL ?? "https://your-worker.workers.dev";
+
+// meme images in /public — must match worker MEME_COUNT
+const MEMES = Array.from({ length: 15 }, (_, i) => `/meme${i + 1}.png`);
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+declare global { interface Window { faceapi: any; } }
+
+async function analyzeMeme(src: string): Promise<FaceRatios | null> {
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+  img.src = src;
+  await new Promise<void>((res, rej) => { img.onload = () => res(); img.onerror = rej; });
+  const result = await window.faceapi
+    ?.detectSingleFace(img, new window.faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
+    .withFaceLandmarks(true);
+  if (!result) return null;
+  return computeRatios(result.landmarks.positions);
 }
 
-const MEMES = [
-  { src: "/meme1.png", label: "1" },
-  { src: "/meme2.png", label: "2" },
-  { src: "/meme3.png", label: "3" },
-  { src: "/meme4.png", label: "4" },
-  { src: "/meme5.png", label: "5" },
-  { src: "/meme6.png", label: "6" },
-  { src: "/meme7.png", label: "7" },
-  { src: "/meme8.png", label: "8" },
-  { src: "/meme9.png", label: "9" },
-  { src: "/meme10.png", label: "10" },
-  { src: "/meme11.png", label: "11" },
-  { src: "/meme12.png", label: "12" },
-  { src: "/meme13.png", label: "13" },
-  { src: "/meme14.png", label: "14" },
-  { src: "/meme15.png", label: "15" },
-];
-
-
-type Point = { x: number; y: number };
-
-function dist(a: Point, b: Point) {
-  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+function ScoreBar({ score, color }: { score: number | null; color: string }) {
+  return (
+    <div style={{ width: "100%", height: 8, background: "#1a1a1a", borderRadius: 4, overflow: "hidden" }}>
+      <div style={{
+        height: "100%", width: `${score ?? 0}%`, background: color,
+        borderRadius: 4, transition: "width 0.4s ease",
+      }} />
+    </div>
+  );
 }
 
-interface FaceRatios {
-  mouthOpenness: number;
-  mouthWidth: number;
-  leftEyeOpenness: number;
-  rightEyeOpenness: number;
-  browRaise: number;
+function VideoPanel({
+  stream, videoRef, label, score, isWinner, isTie,
+}: {
+  stream?: MediaStream | null;
+  videoRef?: React.RefObject<HTMLVideoElement>;
+  label: string;
+  score: number | null;
+  isWinner: boolean;
+  isTie: boolean;
+}) {
+  const internalRef = useRef<HTMLVideoElement>(null);
+  const ref = videoRef ?? internalRef;
+
+  useEffect(() => {
+    if (stream && ref.current) {
+      ref.current.srcObject = stream;
+    }
+  }, [stream, ref]);
+
+  const scoreColor = score == null ? "#555"
+    : score > 66 ? "#22c55e"
+    : score > 33 ? "#f59e0b"
+    : "#ef4444";
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center", flex: 1, minWidth: 0 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: "0.75rem", color: "#666", letterSpacing: "0.1em", textTransform: "uppercase" }}>
+          {label}
+        </span>
+        {isWinner && !isTie && (
+          <span style={{
+            background: "#22c55e22", border: "1px solid #22c55e", color: "#22c55e",
+            fontSize: "0.65rem", padding: "2px 8px", borderRadius: 20, letterSpacing: "0.08em",
+          }}>WINNER</span>
+        )}
+        {isTie && (
+          <span style={{
+            background: "#f59e0b22", border: "1px solid #f59e0b", color: "#f59e0b",
+            fontSize: "0.65rem", padding: "2px 8px", borderRadius: 20,
+          }}>TIE</span>
+        )}
+      </div>
+      <div style={{
+        position: "relative", borderRadius: 12, overflow: "hidden",
+        border: `2px solid ${isWinner && !isTie ? "#22c55e" : "#2a2a2a"}`,
+        width: "100%", aspectRatio: "4/3", background: "#111",
+        transition: "border-color 0.4s",
+      }}>
+        <video ref={ref} autoPlay muted playsInline
+          style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+        {score != null && (
+          <div style={{
+            position: "absolute", top: 8, right: 8,
+            background: "rgba(0,0,0,0.75)", borderRadius: 8,
+            padding: "4px 10px", fontSize: "1rem", fontWeight: "bold", color: scoreColor,
+          }}>{score}%</div>
+        )}
+      </div>
+      <ScoreBar score={score} color={scoreColor} />
+    </div>
+  );
 }
 
-function computeRatios(pts: Point[]): FaceRatios {
-  const faceWidth  = dist(pts[0],  pts[16]);
-  const faceHeight = dist(pts[19], pts[8]);
-  const mouthH     = dist(pts[51], pts[57]);
-  const mouthW     = dist(pts[48], pts[54]);
-  const lEyeH      = dist(pts[37], pts[41]);
-  const lEyeW      = dist(pts[36], pts[39]);
-  const rEyeH      = dist(pts[44], pts[46]);
-  const rEyeW      = dist(pts[42], pts[45]);
-  const lBrowEye   = dist(pts[19], pts[37]);
-  const rBrowEye   = dist(pts[24], pts[44]);
+// ── Main Component ────────────────────────────────────────────────────────────
 
-  return {
-    mouthOpenness:    mouthH / (mouthW  || 1),
-    mouthWidth:       mouthW / (faceWidth || 1),
-    leftEyeOpenness:  lEyeH  / (lEyeW   || 1),
-    rightEyeOpenness: rEyeH  / (rEyeW   || 1),
-    browRaise:        ((lBrowEye + rBrowEye) / 2) / (faceHeight || 1),
+export default function MultiplayerMemeMatcher() {
+  // Current meme target ratios
+  const [targetRatios, setTargetRatios] = useState<FaceRatios | null>(null);
+  const [memeImgSrc, setMemeImgSrc] = useState<string | null>(null);
+  const [memeAnalyzing, setMemeAnalyzing] = useState(false);
+
+  // Peer score (received via datachannel simulation — we use WS score_update)
+  const [peerScore, setPeerScore] = useState<number | null>(null);
+  const [myScore, setMyScore] = useState<number | null>(null);
+
+  // Game round active?
+  const [roundActive, setRoundActive] = useState(false);
+
+  // WebRTC
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+
+  // Signaling callbacks (stable refs to avoid hook re-creation)
+  const onRoundStartRef = useRef<(i: number) => void>(() => {});
+  const onRoundEndRef = useRef<(r: any) => void>(() => {});
+
+  const onOfferRef = useRef<(s: RTCSessionDescriptionInit) => void>(() => {});
+  const onAnswerRef = useRef<(s: RTCSessionDescriptionInit) => void>(() => {});
+  const onIceCandidateRef = useRef<(c: RTCIceCandidateInit) => void>(() => {});
+
+  const { state: sigState, startMatchmaking, sendRematch, sendScoreUpdate, sendSignal, userId } =
+    useSignaling({
+      workerUrl: WORKER_URL,
+      onOffer: useCallback((s) => onOfferRef.current(s), []),
+      onAnswer: useCallback((s) => onAnswerRef.current(s), []),
+      onIceCandidate: useCallback((c) => onIceCandidateRef.current(c), []),
+      onRoundStart: useCallback((i) => onRoundStartRef.current(i), []),
+      onRoundEnd: useCallback((r) => onRoundEndRef.current(r), []),
+    });
+
+  const { remoteStream, startAsHost, handleOffer, handleAnswer, handleIceCandidate } = useWebRTC({
+    role: sigState.roomInfo?.role ?? null,
+    localStream,
+    onSignal: sendSignal,
+  });
+
+  // Wire up stable refs
+  onOfferRef.current = handleOffer;
+  onAnswerRef.current = handleAnswer;
+  onIceCandidateRef.current = handleIceCandidate;
+
+  // Score callback — send to server
+  const handleMyScore = useCallback((score: number) => {
+    setMyScore(score);
+    sendScoreUpdate(score);
+  }, [sendScoreUpdate]);
+
+  const { videoRef: faceVideoRef, modelsReady, cameraReady, faceDetected, similarity } =
+    useFaceDetection({ onScore: handleMyScore, targetRatios, active: roundActive });
+
+  // Wire local video ref to face detection video element
+  useEffect(() => {
+    if (cameraReady && faceVideoRef.current?.srcObject) {
+      const stream = faceVideoRef.current.srcObject as MediaStream;
+      setLocalStream(stream);
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+    }
+  }, [cameraReady, faceVideoRef]);
+
+  // When both in room and host, initiate WebRTC offer
+  useEffect(() => {
+    if (sigState.phase === "in_room" && sigState.roomInfo?.role === "host" && sigState.peerCount === 2) {
+      startAsHost();
+    }
+  }, [sigState.phase, sigState.roomInfo?.role, sigState.peerCount, startAsHost]);
+
+  // Handle round start
+  onRoundStartRef.current = async (memeIndex: number) => {
+    const src = MEMES[memeIndex];
+    setMemeImgSrc(src);
+    setMemeAnalyzing(true);
+    setRoundActive(false);
+    setMyScore(null);
+    setPeerScore(null);
+    const ratios = await analyzeMeme(src);
+    setTargetRatios(ratios);
+    setMemeAnalyzing(false);
+    setRoundActive(true);
   };
-}
 
+  // Handle round end
+  onRoundEndRef.current = (result: any) => {
+    setRoundActive(false);
+    // Extract peer score
+    const peerUserId = Object.keys(result.results).find((id) => id !== userId);
+    if (peerUserId) setPeerScore(result.results[peerUserId]);
+    setMyScore(result.results[userId] ?? null);
+  };
 
-type Difficulty = "easy" | "medium" | "hard";
+  // ── Derived ─────────────────────────────────────────────────────────────────
 
-const DIFFICULTY_CONFIG: Record<Difficulty, {
-  sigmaMultiplier: number;
-  exponent: number;
-}> = {
-  easy: {
-    sigmaMultiplier: 1.8,   // more forgiving
-    exponent: 1.2,
-  },
-  medium: {
-    sigmaMultiplier: 1.2,
-    exponent: 1.5,
-  },
-  hard: {
-    sigmaMultiplier: 1.0,   // current behavior
-    exponent: 1.8,
-  },
-};
-
-const FEATURE_CONFIG: { key: keyof FaceRatios; weight: number; sigma: number }[] = [
-  { key: "mouthOpenness",    weight: 0.35, sigma: 0.06 },
-  { key: "mouthWidth",       weight: 0.20, sigma: 0.04 },
-  { key: "leftEyeOpenness",  weight: 0.18, sigma: 0.05 },
-  { key: "rightEyeOpenness", weight: 0.18, sigma: 0.05 },
-  { key: "browRaise",        weight: 0.09, sigma: 0.04 },
-];
-
-function ratioSimilarity(
-  a: FaceRatios,
-  b: FaceRatios,
-  difficulty: Difficulty
-): number {
-  const { sigmaMultiplier, exponent } = DIFFICULTY_CONFIG[difficulty];
-
-  let score = 0;
-
-  for (const { key, weight, sigma } of FEATURE_CONFIG) {
-    const adjustedSigma = sigma * sigmaMultiplier;
-    const diff = a[key] - b[key];
-
-    const featureSim = Math.exp(
-      -(diff * diff) / (2 * adjustedSigma * adjustedSigma)
-    );
-
-    score += featureSim * weight;
-  }
-
-  return Math.round(Math.pow(score, exponent) * 100);
-}
-
-
-
-
-export default function MemeMatcher() {
-  const videoRef      = useRef<HTMLVideoElement>(null);
-  const liveCanvasRef = useRef<HTMLCanvasElement>(null);
-  const memeCanvasRef = useRef<HTMLCanvasElement>(null);
-  const streamRef     = useRef<MediaStream | null>(null);
-  const intervalRef   = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const [status, setStatus]             = useState<"loading" | "ready" | "error">("loading");
-  const [loadingStep, setLoadingStep]   = useState("Loading face models...");
-  const [memeIndex, setMemeIndex]       = useState(0);
-  const [memeRatios, setMemeRatios]     = useState<FaceRatios | null>(null);
-  const [similarity, setSimilarity]     = useState<number | null>(null);
-  const [faceDetected, setFaceDetected] = useState(false);
-  const [memeLoaded, setMemeLoaded]     = useState(false);
-  const [difficulty, setDifficulty] = useState<Difficulty>("hard");
-
-  useEffect(() => {
-    const script = document.createElement("script");
-    script.src = "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js";
-    script.async = true;
-    script.onload = async () => {
-      try {
-        setLoadingStep("Loading landmark model...");
-        const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model";
-        await window.faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
-        await window.faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL);
-        setLoadingStep("Starting camera...");
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 360, facingMode: "user" }, audio: false });
-        streamRef.current = stream;
-        setStatus("ready");
-      } catch (e) {
-        console.error(e);
-        setStatus("error");
-      }
-    };
-    script.onerror = () => setStatus("error");
-    document.head.appendChild(script);
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      document.head.removeChild(script);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (status === "ready" && videoRef.current && streamRef.current) {
-      videoRef.current.srcObject = streamRef.current;
-    }
-  }, [status]);
-
-  const analyzeMeme = useCallback(async (src: string) => {
-    setMemeLoaded(false);
-    setMemeRatios(null);
-    setSimilarity(null);
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.src = src;
-    await new Promise<void>((res, rej) => { img.onload = () => res(); img.onerror = rej; });
-    const result = await window.faceapi
-      .detectSingleFace(img, new window.faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
-      .withFaceLandmarks(true);
-    const canvas = memeCanvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    canvas.width  = img.naturalWidth;
-    canvas.height = img.naturalHeight;
-    ctx.drawImage(img, 0, 0);
-    if (result) {
-      setMemeRatios(computeRatios(result.landmarks.positions));
-    } else {
-      console.warn("No face detected in meme:", src);
-    }
-    setMemeLoaded(true);
-  }, []);
-
-  useEffect(() => {
-    if (status === "ready") analyzeMeme(MEMES[memeIndex].src);
-  }, [status, memeIndex, analyzeMeme]);
-
-  const detectLive = useCallback(async () => {
-    const video = videoRef.current;
-    const canvas = liveCanvasRef.current;
-    if (!video || !canvas || video.readyState < 2 || !window.faceapi) return;
-    const result = await window.faceapi
-      .detectSingleFace(video, new window.faceapi.TinyFaceDetectorOptions({ inputSize: 224 }))
-      .withFaceLandmarks(true);
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    if (!result) {
-      setFaceDetected(false);
-      setSimilarity(null);
-      return;
-    }
-    setFaceDetected(true);
-    if (memeRatios) {
-      setSimilarity(
-	  ratioSimilarity(
-	    computeRatios(result.landmarks.positions),
-	    memeRatios,
-	    difficulty
-	  )
-);
-    }
-  }, [memeRatios]);
-
-  useEffect(() => {
-    if (status === "ready") {
-      intervalRef.current = setInterval(detectLive, 300);
-    }
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
-  }, [status, detectLive]);
+  const { phase, secondsLeft, roundResult, rematchVotes, roomInfo } = sigState;
+  const iWon = roundResult?.winnerId === userId;
+  const isTie = roundResult !== null && roundResult.winnerId === null;
+  const peerWon = roundResult?.winnerId !== null && roundResult?.winnerId !== userId;
+  const iVotedRematch = rematchVotes.has(userId);
 
   const simColor = similarity == null ? "#555"
     : similarity > 66 ? "#22c55e"
     : similarity > 33 ? "#f59e0b"
     : "#ef4444";
 
-  const simLabel = similarity == null ? "—"
-    : similarity > 66 ? "Great match!"
-    : similarity > 33 ? "Getting there..."
-    : "Keep trying!";
+  // ── Render ───────────────────────────────────────────────────────────────────
 
   return (
     <main style={{
-      minHeight: "100vh", background: "#0f0f0f", color: "#f0f0f0",
+      minHeight: "100vh", background: "#0a0a0a", color: "#e8e8e8",
       fontFamily: "'Courier New', monospace",
       display: "flex", flexDirection: "column",
-      alignItems: "center", justifyContent: "center",
-      padding: "24px", gap: "24px",
+      alignItems: "center", justifyContent: "flex-start",
+      padding: "32px 24px", gap: 24,
+      boxSizing: "border-box",
     }}>
-      <h1 style={{ fontSize: "clamp(1.2rem, 2.5vw, 1.8rem)", letterSpacing: "0.15em", textTransform: "uppercase", margin: 0 }}>
-        Meme Face Match
+      {/* Hidden face detection video */}
+      <video ref={faceVideoRef} autoPlay muted playsInline
+        style={{ display: "none" }} />
+
+      <h1 style={{
+        fontSize: "clamp(1.1rem, 2.5vw, 1.6rem)", letterSpacing: "0.2em",
+        textTransform: "uppercase", margin: 0,
+        color: "#fff",
+      }}>
+        MEME FACE MATCH <span style={{ color: "#666", fontSize: "0.7em" }}>// MULTIPLAYER</span>
       </h1>
 
-      {status === "loading" && (
-        <div style={{ textAlign: "center", color: "#888", fontSize: "0.9rem" }}>
+      {/* ── IDLE / LANDING ── */}
+      {(phase === "idle" || phase === "error") && (
+        <div style={{
+          display: "flex", flexDirection: "column", alignItems: "center",
+          gap: 24, marginTop: 40,
+        }}>
+          <p style={{ color: "#555", fontSize: "0.9rem", textAlign: "center", maxWidth: 420 }}>
+            Get matched with a random opponent. You both have 10 seconds to copy the meme face.
+            Highest average similarity wins.
+          </p>
+          {phase === "error" && (
+            <p style={{ color: "#ef4444", fontSize: "0.8rem" }}>Connection error. Try again.</p>
+          )}
+          {!modelsReady && (
+            <p style={{ color: "#555", fontSize: "0.75rem" }}>
+              {cameraReady ? "Loading face models..." : "Loading..."}
+            </p>
+          )}
+          <button onClick={startMatchmaking} disabled={!modelsReady} style={{
+            padding: "14px 48px", background: modelsReady ? "#fff" : "#1a1a1a",
+            color: modelsReady ? "#0a0a0a" : "#333",
+            border: "none", borderRadius: 8, fontSize: "0.95rem",
+            letterSpacing: "0.15em", textTransform: "uppercase",
+            cursor: modelsReady ? "pointer" : "not-allowed",
+            fontFamily: "inherit", fontWeight: "bold",
+            transition: "all 0.2s",
+          }}>
+            {modelsReady ? "MATCHMAKE" : "Loading models..."}
+          </button>
+        </div>
+      )}
+
+      {/* ── QUEUED ── */}
+      {phase === "queued" && (
+        <div style={{ textAlign: "center", marginTop: 60 }}>
           <div style={{
-            width: 40, height: 40, border: "3px solid #333", borderTop: "3px solid #fff",
-            borderRadius: "50%", animation: "spin 1s linear infinite", margin: "0 auto 12px",
+            width: 40, height: 40, border: "2px solid #222", borderTop: "2px solid #fff",
+            borderRadius: "50%", animation: "spin 1s linear infinite",
+            margin: "0 auto 20px",
           }} />
-          {loadingStep}
+          <p style={{ color: "#555", fontSize: "0.85rem", letterSpacing: "0.1em" }}>
+            SEARCHING FOR OPPONENT...
+          </p>
           <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
         </div>
       )}
 
-      {status === "error" && (
-        <div style={{ color: "#ef4444", textAlign: "center" }}>
-          <p>Failed to load models or camera.</p>
-          <p style={{ fontSize: "0.8rem", color: "#888" }}>Check console for details.</p>
-        </div>
-      )}
-
-      {status === "ready" && (
+      {/* ── IN ROOM ── */}
+      {(phase === "in_room" || phase === "matched") && (
         <>
-          <div style={{ display: "flex", gap: "20px", alignItems: "flex-start", flexWrap: "wrap", justifyContent: "center" }}>
-
-            {/* Webcam panel */}
-            <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center" }}>
-              <span style={{ fontSize: "0.75rem", color: "#666", letterSpacing: "0.1em", textTransform: "uppercase" }}>You</span>
-              <div style={{
-                position: "relative", borderRadius: "12px", overflow: "hidden",
-                border: faceDetected ? "2px solid #22c55e" : "2px solid #333",
-                width: 480, height: 360, background: "#111", transition: "border-color 0.3s",
+          {/* Timer / status bar */}
+          <div style={{
+            display: "flex", alignItems: "center", gap: 16,
+            background: "#111", border: "1px solid #1e1e1e",
+            borderRadius: 10, padding: "10px 24px",
+            width: "100%", maxWidth: 900, boxSizing: "border-box",
+            justifyContent: "space-between",
+          }}>
+            <span style={{ fontSize: "0.7rem", color: "#444", letterSpacing: "0.08em" }}>
+              {roundActive ? "ROUND ACTIVE" : roundResult ? "ROUND OVER" : "WAITING FOR OPPONENT..."}
+            </span>
+            {secondsLeft != null && (
+              <span style={{
+                fontSize: "1.4rem", fontWeight: "bold",
+                color: secondsLeft <= 3 ? "#ef4444" : "#fff",
+                transition: "color 0.3s",
               }}>
-                <video ref={videoRef} width={480} height={360} autoPlay muted playsInline
-                  style={{ display: "block", width: "100%", height: "100%" }} />
-                <canvas ref={liveCanvasRef} width={480} height={360}
-                  style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", pointerEvents: "none" }} />
-                {!faceDetected && (
-                  <div style={{
-                    position: "absolute", bottom: 8, left: 8, background: "rgba(0,0,0,0.7)",
-                    padding: "4px 10px", borderRadius: 6, fontSize: "0.75rem", color: "#888",
-                  }}>No face detected</div>
-                )}
-              </div>
-            </div>
-
-            {/* Score */}
-            <div style={{
-              display: "flex", flexDirection: "column", alignItems: "center",
-              justifyContent: "center", gap: 8, minWidth: 90, alignSelf: "center",
-            }}>
-              <div style={{ fontSize: "0.65rem", color: "#555", letterSpacing: "0.08em" }}>MATCH</div>
-              <div style={{ fontSize: "2.2rem", fontWeight: "bold", color: simColor, transition: "color 0.4s", minWidth: 70, textAlign: "center" }}>
-                {similarity != null ? `${similarity}%` : "—"}
-              </div>
-              <div style={{ fontSize: "0.7rem", color: "#555", textAlign: "center", maxWidth: 80 }}>{simLabel}</div>
-            </div>
-
-            {/* Meme panel */}
-            <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center" }}>
-              <span style={{ fontSize: "0.75rem", color: "#666", letterSpacing: "0.1em", textTransform: "uppercase" }}>
-                Meme {MEMES[memeIndex].label}
+                {secondsLeft}s
               </span>
+            )}
+            <span style={{ fontSize: "0.7rem", color: "#333" }}>
+              {sigState.peerCount}/2 players
+            </span>
+          </div>
+
+          {/* Main game area */}
+          <div style={{
+            display: "flex", gap: 16, alignItems: "flex-start",
+            width: "100%", maxWidth: 1100, flexWrap: "wrap",
+            justifyContent: "center",
+          }}>
+            {/* My video */}
+            <div style={{ flex: 1, minWidth: 240, maxWidth: 360 }}>
+              <VideoPanel
+                videoRef={localVideoRef}
+                label="YOU"
+                score={roundActive ? (similarity ?? null) : myScore}
+                isWinner={iWon}
+                isTie={isTie}
+              />
+            </div>
+
+            {/* Meme + score center */}
+            <div style={{
+              display: "flex", flexDirection: "column", gap: 12,
+              alignItems: "center", justifyContent: "center",
+              minWidth: 200, flex: "0 0 auto",
+            }}>
+              {memeImgSrc ? (
+                <div style={{
+                  borderRadius: 12, overflow: "hidden",
+                  border: "2px solid #2a2a2a",
+                  width: 220, background: "#111",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  minHeight: 165,
+                }}>
+                  {memeAnalyzing ? (
+                    <span style={{ color: "#444", fontSize: "0.75rem" }}>Analyzing...</span>
+                  ) : (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={memeImgSrc} alt="meme" style={{ width: "100%", display: "block" }} />
+                  )}
+                </div>
+              ) : (
+                <div style={{
+                  width: 220, height: 165, borderRadius: 12,
+                  border: "2px dashed #1e1e1e", display: "flex",
+                  alignItems: "center", justifyContent: "center",
+                }}>
+                  <span style={{ color: "#333", fontSize: "0.75rem" }}>Meme incoming...</span>
+                </div>
+              )}
+
+              {/* VS badge */}
               <div style={{
-                position: "relative", borderRadius: "12px", overflow: "hidden",
-                border: memeRatios ? "2px solid #22c55e" : "2px solid #555",
-                width: 480, height: 360, background: "#1a1a1a",
-                display: "flex", alignItems: "center", justifyContent: "center",
-                transition: "border-color 0.3s",
-              }}>
-                <canvas ref={memeCanvasRef}
-                  style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", display: memeLoaded ? "block" : "none" }} />
-                {!memeLoaded && <div style={{ color: "#555", fontSize: "0.8rem" }}>Analyzing face...</div>}
-                {memeLoaded && !memeRatios && (
-                  <div style={{
-                    position: "absolute", bottom: 8, left: 8, background: "rgba(180,0,0,0.7)",
-                    padding: "4px 10px", borderRadius: 6, fontSize: "0.7rem", color: "#fff",
-                  }}>No face detected in meme</div>
-                )}
-              </div>
+                fontSize: "0.75rem", color: "#333",
+                letterSpacing: "0.2em", fontWeight: "bold",
+              }}>VS</div>
+            </div>
+
+            {/* Peer video */}
+            <div style={{ flex: 1, minWidth: 240, maxWidth: 360 }}>
+              <VideoPanel
+                stream={remoteStream}
+                label="OPPONENT"
+                score={roundActive ? null : peerScore}
+                isWinner={peerWon}
+                isTie={isTie}
+              />
             </div>
           </div>
 
-          {/* Similarity bar */}
-          {memeRatios && (
+          {/* Round result panel */}
+          {roundResult && (
             <div style={{
-              background: "#1a1a1a", border: "1px solid #2a2a2a",
-              borderRadius: 12, padding: "14px 28px", minWidth: 320, textAlign: "center",
+              background: "#0e0e0e", border: "1px solid #1e1e1e",
+              borderRadius: 12, padding: "24px 32px",
+              textAlign: "center", display: "flex",
+              flexDirection: "column", gap: 16, alignItems: "center",
+              width: "100%", maxWidth: 500,
             }}>
-              <div style={{ fontSize: "0.7rem", color: "#555", marginBottom: 8, letterSpacing: "0.1em" }}>
-                LANDMARK SIMILARITY
+              <div style={{
+                fontSize: "clamp(1rem, 3vw, 1.5rem)",
+                fontWeight: "bold",
+                color: isTie ? "#f59e0b" : iWon ? "#22c55e" : "#ef4444",
+              }}>
+                {isTie ? "IT'S A TIE!" : iWon ? "YOU WIN! 🎉" : "YOU LOSE!"}
               </div>
-              <div style={{ height: 8, background: "#2a2a2a", borderRadius: 4, overflow: "hidden" }}>
-                <div style={{
-                  height: "100%", width: `${similarity ?? 0}%`,
-                  background: simColor, borderRadius: 4,
-                  transition: "width 0.4s ease, background 0.4s ease",
-                }} />
+              <div style={{ display: "flex", gap: 24, fontSize: "0.85rem", color: "#555" }}>
+                <span>You: <b style={{ color: "#fff" }}>{myScore ?? 0}%</b></span>
+                <span>Opponent: <b style={{ color: "#fff" }}>{peerScore ?? 0}%</b></span>
+              </div>
+
+              {/* Rematch votes */}
+              <div style={{ display: "flex", gap: 12 }}>
+                <button onClick={sendRematch} disabled={iVotedRematch} style={{
+                  padding: "10px 28px",
+                  background: iVotedRematch ? "#1a1a1a" : "#fff",
+                  color: iVotedRematch ? "#444" : "#0a0a0a",
+                  border: "none", borderRadius: 8,
+                  fontSize: "0.8rem", letterSpacing: "0.1em",
+                  cursor: iVotedRematch ? "default" : "pointer",
+                  fontFamily: "inherit", fontWeight: "bold",
+                }}>
+                  {iVotedRematch ? `WAITING... (${rematchVotes.size}/2)` : "REMATCH"}
+                </button>
+                <button onClick={startMatchmaking} style={{
+                  padding: "10px 28px",
+                  background: "transparent",
+                  color: "#555", border: "1px solid #222",
+                  borderRadius: 8, fontSize: "0.8rem",
+                  letterSpacing: "0.1em", cursor: "pointer",
+                  fontFamily: "inherit",
+                }}>
+                  NEW MATCH
+                </button>
               </div>
             </div>
           )}
-          
-          <div style={{ display: "flex", gap: 10 }}>
-	  {(["easy", "medium", "hard"] as Difficulty[]).map((d) => (
-	    <button
-	      key={d}
-	      onClick={() => setDifficulty(d)}
-	      style={{
-		padding: "6px 14px",
-		background: difficulty === d ? "#2a2a2a" : "transparent",
-		border: `1px solid ${difficulty === d ? "#555" : "#2a2a2a"}`,
-		borderRadius: 6,
-		color: difficulty === d ? "#fff" : "#555",
-		cursor: "pointer",
-		fontSize: "0.75rem",
-	      }}
-	    >
-	      {d.toUpperCase()}
-	    </button>
-	  ))}
-	</div>
 
-          {/* Meme switcher */}
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "center" }}>
-            {MEMES.map((m, i) => (
-              <button key={m.src} onClick={() => setMemeIndex(i)} style={{
-                padding: "6px 18px",
-                background: memeIndex === i ? "#2a2a2a" : "transparent",
-                border: `1px solid ${memeIndex === i ? "#555" : "#2a2a2a"}`,
-                borderRadius: 6, color: memeIndex === i ? "#fff" : "#555",
-                cursor: "pointer", fontSize: "0.8rem", transition: "all 0.2s",
-              }}>
-                {m.label}
-              </button>
-            ))}
-          </div>
-
-          <p style={{ color: "#333", fontSize: "0.65rem", textAlign: "center", maxWidth: 500 }}>
-            Comparing 68-point facial landmarks in real-time. No data leaves your device.
+          <p style={{ color: "#222", fontSize: "0.6rem", textAlign: "center" }}>
+            Room: {roomInfo?.roomId?.slice(0, 8)}... · Video is peer-to-peer · No data stored
           </p>
         </>
       )}

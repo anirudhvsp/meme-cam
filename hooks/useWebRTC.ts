@@ -37,9 +37,12 @@ export function useWebRTC({ role, localStream, onSignal }: UseWebRTCOptions) {
     };
 
     pc.ontrack = (ev) => {
-      const stream = ev.streams[0];
-      if (stream) setRemoteStream(stream);
-    };
+	  setRemoteStream((prev) => {
+	    const stream = prev ?? new MediaStream();
+	    stream.addTrack(ev.track);
+	    return stream;
+	  });
+	};
 
     // Add local tracks
     if (localStream) {

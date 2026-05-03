@@ -121,7 +121,20 @@ export function useSignaling({
           setState((s) => ({ ...s, peerCount: data.playerCount as number }));
           break;
         case "player_left":
-          setState((s) => ({ ...s, peerCount: data.playerCount as number, phase: "idle" }));
+	  setState((s) => ({
+	    ...s,
+	    peerCount: data.playerCount as number
+	  }));
+
+	  setTimeout(() => {
+	    setState((s) => {
+	      if (s.peerCount === 0) {
+		return { ...s, phase: "idle", roomInfo: null };
+	      }
+	      return s;
+	    });
+	  }, 3000);
+	  break;
           break;
         case "round_start":
           setState((s) => ({

@@ -173,7 +173,7 @@ export default function MultiplayerMemeMatcher() {
     if (cameraReady && faceVideoRef.current?.srcObject) {
       const stream = faceVideoRef.current.srcObject as MediaStream;
       setLocalStream(stream);
-      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+      //if (localVideoRef.current) localVideoRef.current.srcObject = stream;
     }
   }, [cameraReady, faceVideoRef]);
 
@@ -327,7 +327,7 @@ export default function MultiplayerMemeMatcher() {
             {/* My video */}
             <div style={{ flex: 1, minWidth: 240, maxWidth: 360 }}>
               <VideoPanel
-                videoRef={localVideoRef}
+                stream={localStream}
                 label="YOU"
                 score={roundActive ? (similarity ?? null) : myScore}
                 isWinner={iWon}

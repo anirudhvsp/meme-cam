@@ -29,8 +29,21 @@ async function analyzeMeme(src: string): Promise<FaceRatios | null> {
   img.crossOrigin = "anonymous";
   img.src = src;
   await new Promise<void>((res, rej) => { img.onload = () => res(); img.onerror = rej; });
+
+  // Draw to a canvas before running detection.
+  // On mobile browsers (especially iOS), face-api can't reliably read pixel
+  // data directly from an HTMLImageElement due to cross-origin canvas tainting
+  // and WebGL texture restrictions. Drawing to a same-origin canvas first
+  // sidesteps both issues.
+  const canvas = document.createElement("canvas");
+  canvas.width  = 320;
+  canvas.height = Math.round(320 * (img.naturalHeight / (img.naturalWidth || 1)));
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
   const result = await window.faceapi
-    ?.detectSingleFace(img, new window.faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
+    ?.detectSingleFace(canvas, new window.faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }))
     .withFaceLandmarks(true);
   if (!result) return null;
   return computeRatios(result.landmarks.positions);
@@ -231,9 +244,9 @@ export default function MultiplayerMemeMatcher() {
       padding: "32px 24px", gap: 24,
       boxSizing: "border-box",
     }}>
-      {/* Hidden face detection video */}
+      {/* Hidden face detection video — autoPlay via play() call inside useFaceDetection for iOS */}
       <video ref={faceVideoRef} autoPlay muted playsInline
-        style={{ display: "none" }} />
+        style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }} />
 
       <h1 style={{
         fontSize: "clamp(1.1rem, 2.5vw, 1.6rem)", letterSpacing: "0.2em",

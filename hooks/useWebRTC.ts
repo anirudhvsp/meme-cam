@@ -37,14 +37,11 @@ export function useWebRTC({ role, localStream, onSignal }: UseWebRTCOptions) {
     };
 
     pc.ontrack = (ev) => {
-	  setRemoteStream((prev) => {
-	    const stream = prev ?? new MediaStream();
-	    stream.addTrack(ev.track);
-	    return stream;
-	  });
-	};
+      const incomingStream = new MediaStream();
+      incomingStream.addTrack(ev.track);
+      setRemoteStream(incomingStream);
+    };
 
-    // Add local tracks
     if (localStream) {
       for (const track of localStream.getTracks()) {
         pc.addTrack(track, localStream);
@@ -54,21 +51,26 @@ export function useWebRTC({ role, localStream, onSignal }: UseWebRTCOptions) {
     return pc;
   }, [localStream, onSignal]);
 
-  // Called when we're ready to start (both peers in room)
   const startAsHost = useCallback(async () => {
     const pc = createPeerConnection();
-    const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: false });
+    const offer = await pc.createOffer({
+      offerToReceiveVideo: true,
+      offerToReceiveAudio: false,
+    });
     await pc.setLocalDescription(offer);
     onSignal({ type: "offer", sdp: offer.sdp, sdpType: offer.type });
   }, [createPeerConnection, onSignal]);
 
-  const handleOffer = useCallback(async (sdp: RTCSessionDescriptionInit) => {
-    const pc = createPeerConnection();
-    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    onSignal({ type: "answer", sdp: answer.sdp, sdpType: answer.type });
-  }, [createPeerConnection, onSignal]);
+  const handleOffer = useCallback(
+    async (sdp: RTCSessionDescriptionInit) => {
+      const pc = createPeerConnection();
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      onSignal({ type: "answer", sdp: answer.sdp, sdpType: answer.type });
+    },
+    [createPeerConnection, onSignal]
+  );
 
   const handleAnswer = useCallback(async (sdp: RTCSessionDescriptionInit) => {
     const pc = pcRef.current;

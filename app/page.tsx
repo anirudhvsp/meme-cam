@@ -259,7 +259,7 @@ export default function MultiplayerMemeMatcher() {
       onIceCandidate: useCallback((c) => onIceCandidateRef.current(c), []),
       onRoundStart:   useCallback((i) => onRoundStartRef.current(i),   []),
       onRoundEnd:     useCallback((r) => onRoundEndRef.current(r),     []),
-      onPeerScore:    useCallback((s) => onPeerScoreRef.current(s),    []),
+      onPeerScore: useCallback((s: number) => onPeerScoreRef.current(s), []),
     });
 
   const { remoteStream, startAsHost, handleOffer, handleAnswer, handleIceCandidate } = useWebRTC({

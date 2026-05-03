@@ -184,17 +184,15 @@ export default function MultiplayerMemeMatcher() {
     sendScoreUpdate(score);
   }, [sendScoreUpdate]);
 
-  const { videoRef: faceVideoRef, modelsReady, cameraReady, faceDetected, similarity } =
-    useFaceDetection({ onScore: handleMyScore, targetRatios, active: roundActive });
+  // localVideoRef is passed to useFaceDetection so detection runs on the visible
+  // video element — no hidden video needed, no iOS frame throttling.
+  const { modelsReady, cameraReady, faceDetected, similarity, localStream: detectedStream } =
+    useFaceDetection({ onScore: handleMyScore, targetRatios, active: roundActive, videoRef: localVideoRef });
 
-  // Wire local video ref to face detection video element
+  // Sync the stream from face detection into localStream state for WebRTC
   useEffect(() => {
-    if (cameraReady && faceVideoRef.current?.srcObject) {
-      const stream = faceVideoRef.current.srcObject as MediaStream;
-      setLocalStream(stream);
-      //if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-    }
-  }, [cameraReady, faceVideoRef]);
+    if (detectedStream) setLocalStream(detectedStream);
+  }, [detectedStream]);
 
   // When both in room and host, initiate WebRTC offer
   useEffect(() => {
@@ -250,16 +248,7 @@ export default function MultiplayerMemeMatcher() {
       padding: "32px 24px", gap: 24,
       boxSizing: "border-box",
     }}>
-      {/* Face detection video — kept in layout with real dimensions but invisible.
-          iOS Safari throttles frame decoding on elements with display:none or
-          width/height of 0/1px, causing blank canvas reads and zero detections. */}
-      <video ref={faceVideoRef} autoPlay muted playsInline
-        style={{
-          position: "fixed", top: 0, left: 0,
-          width: 240, height: 180,
-          visibility: "hidden",
-          pointerEvents: "none",
-        }} />
+      {/* No hidden video — detection runs on the visible localVideoRef element */}
 
       <h1 style={{
         fontSize: "clamp(1.1rem, 2.5vw, 1.6rem)", letterSpacing: "0.2em",
@@ -350,10 +339,11 @@ export default function MultiplayerMemeMatcher() {
             width: "100%", maxWidth: 1100, flexWrap: "wrap",
             justifyContent: "center",
           }}>
-            {/* My video */}
+            {/* My video — videoRef passed so face detection runs on this visible element */}
             <div style={{ flex: 1, minWidth: 240, maxWidth: 360 }}>
               <VideoPanel
                 stream={localStream}
+                videoRef={localVideoRef}
                 label="YOU"
                 score={roundActive ? (similarity ?? null) : myScore}
                 isWinner={iWon}

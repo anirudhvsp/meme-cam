@@ -1,7 +1,11 @@
 /**
  * useFaceDetection
- * Loads face-api.js models, starts the camera, and runs detection on an interval.
- * Exposes similarity score computed against a target FaceRatios object.
+ *
+ * Key architectural change: this hook no longer owns a <video> element.
+ * It opens the camera, exposes the MediaStream, and accepts a videoRef
+ * pointing to whatever <video> element the parent renders (the visible one).
+ * This means detection runs on the same element the user sees — no hidden
+ * video, no iOS frame-throttling, no blank canvas reads.
  */
 
 "use client";
@@ -76,23 +80,25 @@ interface UseFaceDetectionOptions {
   onScore?: (score: number) => void;
   targetRatios: FaceRatios | null;
   active: boolean;
+  // The visible <video> element to run detection against.
+  // Pass the same ref used to display the local camera feed — no hidden video needed.
+  videoRef: React.RefObject<HTMLVideoElement | null>;
 }
 
-export function useFaceDetection({ onScore, targetRatios, active }: UseFaceDetectionOptions) {
+export function useFaceDetection({ onScore, targetRatios, active, videoRef }: UseFaceDetectionOptions) {
   const [modelsReady, setModelsReady]   = useState(false);
   const [cameraReady, setCameraReady]   = useState(false);
   const [faceDetected, setFaceDetected] = useState(false);
   const [similarity, setSimilarity]     = useState<number | null>(null);
   const [loadError, setLoadError]       = useState(false);
+  const [localStream, setLocalStream]   = useState<MediaStream | null>(null);
 
-  const videoRef     = useRef<HTMLVideoElement>(null);
-  const canvasRef    = useRef<HTMLCanvasElement | null>(null);
   const streamRef    = useRef<MediaStream | null>(null);
+  const canvasRef    = useRef<HTMLCanvasElement | null>(null);
   const intervalRef  = useRef<ReturnType<typeof setInterval> | null>(null);
   const detectingRef = useRef(false);
 
-  // Store props in refs so detect() needs zero deps and the interval is
-  // never torn down mid-round when active/targetRatios change.
+  // Stable refs for detect callback — no dep changes, no interval restarts
   const targetRatiosRef = useRef(targetRatios);
   const activeRef       = useRef(active);
   const onScoreRef      = useRef(onScore);
@@ -100,10 +106,9 @@ export function useFaceDetection({ onScore, targetRatios, active }: UseFaceDetec
   useEffect(() => { activeRef.current = active; },             [active]);
   useEffect(() => { onScoreRef.current = onScore; },           [onScore]);
 
-  // ── Load script + models ─────────────────────────────────────────────────────
+  // ── Load face-api ────────────────────────────────────────────────────────────
   useEffect(() => {
     if (typeof window === "undefined") return;
-
     if (window.faceapi?.nets?.tinyFaceDetector?.isLoaded) {
       setModelsReady(true);
       return;
@@ -112,7 +117,6 @@ export function useFaceDetection({ onScore, targetRatios, active }: UseFaceDetec
     const script = document.createElement("script");
     script.src   = FACEAPI_SCRIPT;
     script.async = true;
-
     script.onload = async () => {
       try {
         await window.faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
@@ -125,7 +129,6 @@ export function useFaceDetection({ onScore, targetRatios, active }: UseFaceDetec
     };
     script.onerror = () => setLoadError(true);
     document.head.appendChild(script);
-
     return () => { if (document.head.contains(script)) document.head.removeChild(script); };
   }, []);
 
@@ -139,16 +142,17 @@ export function useFaceDetection({ onScore, targetRatios, active }: UseFaceDetec
         { video: { facingMode: "user" }, audio: false },
         { video: true, audio: false },
       ];
-
       for (const c of attempts) {
         try {
           const stream = await navigator.mediaDevices.getUserMedia(c);
           streamRef.current = stream;
+          setLocalStream(stream);
 
+          // Wire stream into the caller-provided video element
           const video = videoRef.current;
           if (video) {
             video.srcObject = stream;
-            try { await video.play(); } catch { /* autoplay policy — ok */ }
+            try { await video.play(); } catch { /* autoplay policy */ }
           }
 
           if (!canvasRef.current) {
@@ -169,19 +173,17 @@ export function useFaceDetection({ onScore, targetRatios, active }: UseFaceDetec
 
     tryGetCamera();
     return () => { streamRef.current?.getTracks().forEach((t) => t.stop()); };
-  }, [modelsReady]);
+  }, [modelsReady]); // eslint-disable-line react-hooks/exhaustive-deps
+  // ^ videoRef intentionally omitted — it's a stable ref object, its .current
+  //   is read lazily inside tryGetCamera so no re-run needed
 
-  // ── Detection loop ───────────────────────────────────────────────────────────
-  // Empty dep array is intentional — everything is read from refs so this
-  // function reference never changes and the interval never restarts mid-round.
+  // ── Detection ────────────────────────────────────────────────────────────────
   const detect = useCallback(async () => {
     if (detectingRef.current) return;
 
     const video = videoRef.current;
     if (!video || !window.faceapi) return;
     if (video.readyState < 2) return;
-
-    // iOS can power-throttle paused video; un-pause and skip this tick
     if (video.paused || video.ended) {
       try { await video.play(); } catch { /* ignore */ }
       return;
@@ -189,8 +191,8 @@ export function useFaceDetection({ onScore, targetRatios, active }: UseFaceDetec
 
     detectingRef.current = true;
     try {
-      // Draw to canvas before inference. iOS WebGL backend can produce black/stale
-      // frames when reading directly from a <video> element; canvas is always current.
+      // Canvas snapshot ensures face-api reads current pixel data.
+      // On iOS the WebGL backend can return stale frames from a live video element.
       let input: HTMLCanvasElement | HTMLVideoElement = video;
       const canvas = canvasRef.current;
       if (canvas) {
@@ -215,7 +217,6 @@ export function useFaceDetection({ onScore, targetRatios, active }: UseFaceDetec
       }
 
       setFaceDetected(true);
-
       if (activeRef.current && targetRatiosRef.current) {
         const score = ratioSimilarity(
           computeRatios(result.landmarks.positions),
@@ -236,7 +237,7 @@ export function useFaceDetection({ onScore, targetRatios, active }: UseFaceDetec
     const ms = getDetectionInterval();
     intervalRef.current = setInterval(detect, ms);
     return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
-  }, [cameraReady, detect]); // detect is stable — this runs exactly once
+  }, [cameraReady, detect]);
 
-  return { videoRef, modelsReady, cameraReady, faceDetected, similarity, loadError };
+  return { modelsReady, cameraReady, faceDetected, similarity, loadError, localStream };
 }

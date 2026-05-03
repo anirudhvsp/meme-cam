@@ -61,7 +61,7 @@ function ScoreBar({ score, color }: { score: number | null; color: string }) {
 }
 
 function VideoPanel({
-  stream, videoRef, label, score, isWinner, isTie,
+  stream, videoRef, label, score, isWinner, isTie, muted = false,
 }: {
   stream?: MediaStream | null;
   videoRef?: React.RefObject<HTMLVideoElement | null>;
@@ -69,14 +69,20 @@ function VideoPanel({
   score: number | null;
   isWinner: boolean;
   isTie: boolean;
+  muted?: boolean;
 }) {
   const internalRef = useRef<HTMLVideoElement | null>(null);
   const ref = videoRef ?? internalRef;
 
   useEffect(() => {
-    if (stream && ref.current) {
-      ref.current.srcObject = stream;
-    }
+    const el = ref.current;
+    if (!el || !stream) return;
+    el.srcObject = stream;
+    // Explicit play() is required on iOS Safari and some Android browsers.
+    // autoPlay alone is not reliable when srcObject is set programmatically.
+    el.play().catch(() => {
+      // Autoplay policy blocked — fine, the next user gesture will unlock it.
+    });
   }, [stream, ref]);
 
   const scoreColor = score == null ? "#555"
@@ -109,7 +115,7 @@ function VideoPanel({
         width: "100%", aspectRatio: "4/3", background: "#111",
         transition: "border-color 0.4s",
       }}>
-        <video ref={ref} autoPlay muted playsInline
+        <video ref={ref} autoPlay muted={muted} playsInline
           style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
         {score != null && (
           <div style={{
@@ -345,6 +351,7 @@ export default function MultiplayerMemeMatcher() {
                 score={roundActive ? (similarity ?? null) : myScore}
                 isWinner={iWon}
                 isTie={isTie}
+                muted={true}
               />
             </div>
 

@@ -250,9 +250,16 @@ export default function MultiplayerMemeMatcher() {
       padding: "32px 24px", gap: 24,
       boxSizing: "border-box",
     }}>
-      {/* Hidden face detection video — autoPlay via play() call inside useFaceDetection for iOS */}
+      {/* Face detection video — kept in layout with real dimensions but invisible.
+          iOS Safari throttles frame decoding on elements with display:none or
+          width/height of 0/1px, causing blank canvas reads and zero detections. */}
       <video ref={faceVideoRef} autoPlay muted playsInline
-        style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }} />
+        style={{
+          position: "fixed", top: 0, left: 0,
+          width: 240, height: 180,
+          visibility: "hidden",
+          pointerEvents: "none",
+        }} />
 
       <h1 style={{
         fontSize: "clamp(1.1rem, 2.5vw, 1.6rem)", letterSpacing: "0.2em",

@@ -51,13 +51,13 @@ function VideoPanel({
   stream, videoRef, label, score, isWinner, isTie,
 }: {
   stream?: MediaStream | null;
-  videoRef?: React.RefObject<HTMLVideoElement>;
+  videoRef?: React.RefObject<HTMLVideoElement | null>;
   label: string;
   score: number | null;
   isWinner: boolean;
   isTie: boolean;
 }) {
-  const internalRef = useRef<HTMLVideoElement>(null);
+  const internalRef = useRef<HTMLVideoElement | null>(null);
   const ref = videoRef ?? internalRef;
 
   useEffect(() => {
@@ -128,7 +128,7 @@ export default function MultiplayerMemeMatcher() {
 
   // WebRTC
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
-  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
 
   // Signaling callbacks (stable refs to avoid hook re-creation)
   const onRoundStartRef = useRef<(i: number) => void>(() => {});

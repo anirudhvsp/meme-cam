@@ -56,7 +56,7 @@ export function useWebRTC({ role, localStream, onSignal }: UseWebRTCOptions) {
     const pc = createPeerConnection();
     const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: false });
     await pc.setLocalDescription(offer);
-    onSignal({ type: "offer", type: "offer", sdp: offer.sdp, sdpType: offer.type });
+    onSignal({ type: "offer", sdp: offer.sdp, sdpType: offer.type });
   }, [createPeerConnection, onSignal]);
 
   const handleOffer = useCallback(async (sdp: RTCSessionDescriptionInit) => {

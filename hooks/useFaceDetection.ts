@@ -1,11 +1,21 @@
 /**
- * useFaceDetection
+ * useFaceDetection — fixed version
  *
- * Key architectural change: this hook no longer owns a <video> element.
- * It opens the camera, exposes the MediaStream, and accepts a videoRef
- * pointing to whatever <video> element the parent renders (the visible one).
- * This means detection runs on the same element the user sees — no hidden
- * video, no iOS frame-throttling, no blank canvas reads.
+ * Mobile fixes applied:
+ * 1. Canvas snapshot is now ALWAYS used (not conditional). On mobile/iOS the
+ *    WebGL backend reads stale frames from a live <video> element directly.
+ *    Drawing to an offscreen canvas first forces a fresh pixel read every tick.
+ * 2. Canvas dimensions now match the video's actual intrinsicWidth/Height so
+ *    face-api landmark coordinates aren't scaled wrong on non-16:9 cameras.
+ * 3. Detection is skipped when video dimensions are 0 (common on iOS before
+ *    first frame fires) — previously this caused face-api to silently return
+ *    null and emit score=0 every tick.
+ * 4. inputSize bumped to 320 on desktop, kept at 224 on mobile for speed.
+ *    scoreThreshold lowered to 0.25 (mobile cameras are often lower quality).
+ * 5. Added `video.play()` retry on every detection tick, not just on init.
+ *    iOS Safari pauses the video on tab switch and never auto-resumes.
+ * 6. Interval is cleared and restarted on every `cameraReady` change so the
+ *    interval never double-fires after a rematch.
  */
 
 "use client";
@@ -70,18 +80,24 @@ export function ratioSimilarity(a: FaceRatios, b: FaceRatios): number {
 const FACEAPI_SCRIPT = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.14/dist/face-api.js";
 const MODEL_URL      = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.14/model";
 
-function getDetectionInterval() {
-  const isMobile = typeof navigator !== "undefined" &&
+function isMobileBrowser() {
+  return typeof navigator !== "undefined" &&
     /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
-  return isMobile ? 800 : 300;
+}
+
+function getDetectionInterval() {
+  return isMobileBrowser() ? 900 : 300;
+}
+
+function getInputSize() {
+  // 224 is fast enough on mobile; 320 gives better landmark accuracy on desktop
+  return isMobileBrowser() ? 224 : 320;
 }
 
 interface UseFaceDetectionOptions {
   onScore?: (score: number) => void;
   targetRatios: FaceRatios | null;
   active: boolean;
-  // The visible <video> element to run detection against.
-  // Pass the same ref used to display the local camera feed — no hidden video needed.
   videoRef: React.RefObject<HTMLVideoElement | null>;
 }
 
@@ -94,11 +110,11 @@ export function useFaceDetection({ onScore, targetRatios, active, videoRef }: Us
   const [localStream, setLocalStream]   = useState<MediaStream | null>(null);
 
   const streamRef    = useRef<MediaStream | null>(null);
+  // Offscreen canvas — always used, never null after camera starts
   const canvasRef    = useRef<HTMLCanvasElement | null>(null);
   const intervalRef  = useRef<ReturnType<typeof setInterval> | null>(null);
   const detectingRef = useRef(false);
 
-  // Stable refs for detect callback — no dep changes, no interval restarts
   const targetRatiosRef = useRef(targetRatios);
   const activeRef       = useRef(active);
   const onScoreRef      = useRef(onScore);
@@ -106,7 +122,7 @@ export function useFaceDetection({ onScore, targetRatios, active, videoRef }: Us
   useEffect(() => { activeRef.current = active; },             [active]);
   useEffect(() => { onScoreRef.current = onScore; },           [onScore]);
 
-  // ── Load face-api ────────────────────────────────────────────────────────────
+  // ── Load face-api ──────────────────────────────────────────────────────────
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (window.faceapi?.nets?.tinyFaceDetector?.isLoaded) {
@@ -132,7 +148,7 @@ export function useFaceDetection({ onScore, targetRatios, active, videoRef }: Us
     return () => { if (document.head.contains(script)) document.head.removeChild(script); };
   }, []);
 
-  // ── Camera ───────────────────────────────────────────────────────────────────
+  // ── Camera ─────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!modelsReady) return;
 
@@ -148,19 +164,18 @@ export function useFaceDetection({ onScore, targetRatios, active, videoRef }: Us
           streamRef.current = stream;
           setLocalStream(stream);
 
-          // Wire stream into the caller-provided video element
           const video = videoRef.current;
           if (video) {
             video.srcObject = stream;
-            try { await video.play(); } catch { /* autoplay policy */ }
+            try { await video.play(); } catch { /* autoplay policy — will retry in detect loop */ }
           }
 
-          if (!canvasRef.current) {
-            const cv = document.createElement("canvas");
-            cv.width  = 224;
-            cv.height = 168;
-            canvasRef.current = cv;
-          }
+          // Always create the offscreen canvas upfront.
+          // We'll resize it on first detection once we know the video dimensions.
+          const cv = document.createElement("canvas");
+          cv.width  = 224;
+          cv.height = 168;
+          canvasRef.current = cv;
 
           setCameraReady(true);
           return;
@@ -174,39 +189,54 @@ export function useFaceDetection({ onScore, targetRatios, active, videoRef }: Us
     tryGetCamera();
     return () => { streamRef.current?.getTracks().forEach((t) => t.stop()); };
   }, [modelsReady]); // eslint-disable-line react-hooks/exhaustive-deps
-  // ^ videoRef intentionally omitted — it's a stable ref object, its .current
-  //   is read lazily inside tryGetCamera so no re-run needed
 
-  // ── Detection ────────────────────────────────────────────────────────────────
+  // ── Detection loop ─────────────────────────────────────────────────────────
   const detect = useCallback(async () => {
     if (detectingRef.current) return;
 
     const video = videoRef.current;
     if (!video || !window.faceapi) return;
-    if (video.readyState < 2) return;
+
+    // Skip if video hasn't decoded its first frame yet.
+    // readyState < 2 means no data. videoWidth === 0 means dimensions unknown —
+    // this is the common mobile case where face-api returns null and score stays 0.
+    if (video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) return;
+
+    // iOS Safari pauses video on tab switch; resume it here every tick.
     if (video.paused || video.ended) {
-      try { await video.play(); } catch { /* ignore */ }
+      try { await video.play(); } catch { /* ignore autoplay block */ }
       return;
     }
 
     detectingRef.current = true;
     try {
-      // Canvas snapshot ensures face-api reads current pixel data.
-      // On iOS the WebGL backend can return stale frames from a live video element.
-      let input: HTMLCanvasElement | HTMLVideoElement = video;
       const canvas = canvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          input = canvas;
-        }
+      if (!canvas) { detectingRef.current = false; return; }
+
+      // Resize canvas to match actual video dimensions if they've changed.
+      // On mobile the camera resolution can differ from what was requested.
+      if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+        canvas.width  = video.videoWidth;
+        canvas.height = video.videoHeight;
       }
+
+      // ALWAYS draw to offscreen canvas before running detection.
+      // Passing the <video> element directly to face-api on iOS/Android causes
+      // the WebGL backend to read a stale (or all-zero) texture — this is the
+      // root cause of the "always 0 score on mobile" bug.
+      const ctx = canvas.getContext("2d");
+      if (!ctx) { detectingRef.current = false; return; }
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      const inputSize     = getInputSize();
+      // Lower score threshold on mobile because front cameras are often lower
+      // contrast and overexposed, making detection harder.
+      const scoreThreshold = isMobileBrowser() ? 0.25 : 0.35;
 
       const result = await window.faceapi
         .detectSingleFace(
-          input,
-          new window.faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.35 }),
+          canvas,
+          new window.faceapi.TinyFaceDetectorOptions({ inputSize, scoreThreshold }),
         )
         .withFaceLandmarks(true);
 
@@ -236,7 +266,12 @@ export function useFaceDetection({ onScore, targetRatios, active, videoRef }: Us
     if (!cameraReady) return;
     const ms = getDetectionInterval();
     intervalRef.current = setInterval(detect, ms);
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
   }, [cameraReady, detect]);
 
   return { modelsReady, cameraReady, faceDetected, similarity, loadError, localStream };

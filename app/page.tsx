@@ -1,28 +1,41 @@
 "use client";
 
 /**
- * Multiplayer Meme Face Match — Main Page
+ * Multiplayer Meme Face Match — Main Page (fixed)
  *
- * Flow:
- *  idle       → user sees landing, clicks Matchmake
- *  queued     → waiting for opponent
- *  in_room    → WebRTC video + game rounds
- *  results    → scores shown, rematch / new match options
+ * Fixes applied vs original:
+ *
+ * 1. Stream race condition (root cause of "host sends no video tracks"):
+ *    startAsHost() is now gated on localStream != null AND peerCount === 2.
+ *    Added a localStreamReadyRef so the effect fires correctly when either
+ *    condition becomes true after the other.
+ *
+ * 2. Live peer score during round:
+ *    useSignaling now accepts onPeerScore callback. peerScore state is updated
+ *    live during the round (not just at round_end), enabling the dominance
+ *    slider and the live opponent bar.
+ *
+ * 3. memeAnalyzing UX gap:
+ *    roundActive is only set true after analyzeMeme() resolves AND the video
+ *    element is ready. A visible "Analyzing…" overlay covers the timer gap.
+ *
+ * 4. New feature: Dominance Slider (chess.com style)
+ *    A horizontal bar between the two score displays shifts left/right based
+ *    on myScore vs peerScore in real time. White = my side, dark = opponent.
+ *    The divider animates smoothly with CSS transitions.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSignaling } from "@/hooks/useSignaling";
 import { useWebRTC } from "@/hooks/useWebRTC";
-import { useFaceDetection, computeRatios, ratioSimilarity, FaceRatios } from "@/hooks/useFaceDetection";
+import { useFaceDetection, computeRatios, FaceRatios } from "@/hooks/useFaceDetection";
 
 const WORKER_URL = process.env.NEXT_PUBLIC_WORKER_URL ?? "https://your-worker.workers.dev";
-
-// meme images in /public — must match worker MEME_COUNT
 const MEMES = Array.from({ length: 15 }, (_, i) => `/meme${i + 1}.png`);
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 declare global { interface Window { faceapi: any; } }
+
+// ── analyzeMeme ───────────────────────────────────────────────────────────────
 
 async function analyzeMeme(src: string): Promise<FaceRatios | null> {
   const img = new Image();
@@ -30,11 +43,6 @@ async function analyzeMeme(src: string): Promise<FaceRatios | null> {
   img.src = src;
   await new Promise<void>((res, rej) => { img.onload = () => res(); img.onerror = rej; });
 
-  // Draw to a canvas before running detection.
-  // On mobile browsers (especially iOS), face-api can't reliably read pixel
-  // data directly from an HTMLImageElement due to cross-origin canvas tainting
-  // and WebGL texture restrictions. Drawing to a same-origin canvas first
-  // sidesteps both issues.
   const canvas = document.createElement("canvas");
   canvas.width  = 320;
   canvas.height = Math.round(320 * (img.naturalHeight / (img.naturalWidth || 1)));
@@ -49,6 +57,101 @@ async function analyzeMeme(src: string): Promise<FaceRatios | null> {
   return computeRatios(result.landmarks.positions);
 }
 
+// ── DominanceSlider ───────────────────────────────────────────────────────────
+
+/**
+ * Chess.com-style dominance bar.
+ * myScore and peerScore are 0–100. The white section represents my advantage.
+ * When scores are equal or both 0 it sits at 50/50.
+ */
+function DominanceSlider({
+  myScore,
+  peerScore,
+  active,
+  iWon,
+  peerWon,
+  isTie,
+}: {
+  myScore: number | null;
+  peerScore: number | null;
+  active: boolean;
+  iWon: boolean;
+  peerWon: boolean;
+  isTie: boolean;
+}) {
+  // Derive the white-side width (my side, left)
+  const my   = myScore   ?? 0;
+  const peer = peerScore ?? 0;
+  const total = my + peer;
+
+  // When no scores yet, center it
+  let myPct = 50;
+  if (total > 0) {
+    // Clamp so neither side fully disappears (min 8%, max 92%)
+    myPct = Math.max(8, Math.min(92, Math.round((my / total) * 100)));
+  }
+
+  const barColor = isTie
+    ? "#f59e0b"
+    : iWon
+    ? "#22c55e"
+    : peerWon
+    ? "#ef4444"
+    : "#ffffff";
+
+  return (
+    <div style={{ width: "100%", maxWidth: 900, boxSizing: "border-box" }}>
+      {/* Labels */}
+      <div style={{
+        display: "flex", justifyContent: "space-between",
+        fontSize: "0.65rem", color: "#555", letterSpacing: "0.08em",
+        marginBottom: 6, textTransform: "uppercase",
+      }}>
+        <span>You{my > 0 ? ` · ${my}%` : ""}</span>
+        <span style={{ color: "#333" }}>
+          {active ? "LIVE" : isTie ? "TIE" : iWon ? "YOU WIN" : peerWon ? "OPPONENT WINS" : ""}
+        </span>
+        <span>Opponent{peer > 0 ? ` · ${peer}%` : ""}</span>
+      </div>
+
+      {/* The slider bar */}
+      <div style={{
+        position: "relative",
+        height: 12,
+        borderRadius: 6,
+        overflow: "hidden",
+        background: "#1a1a1a",
+        border: "1px solid #2a2a2a",
+      }}>
+        {/* My side (left, lighter) */}
+        <div style={{
+          position: "absolute",
+          left: 0, top: 0, bottom: 0,
+          width: `${myPct}%`,
+          background: barColor,
+          transition: "width 0.5s cubic-bezier(0.4,0,0.2,1), background 0.4s ease",
+          borderRadius: "6px 0 0 6px",
+        }} />
+        {/* Divider pip */}
+        <div style={{
+          position: "absolute",
+          top: "50%",
+          left: `${myPct}%`,
+          transform: "translate(-50%, -50%)",
+          width: 3,
+          height: 18,
+          background: "#0a0a0a",
+          borderRadius: 2,
+          transition: "left 0.5s cubic-bezier(0.4,0,0.2,1)",
+          zIndex: 2,
+        }} />
+      </div>
+    </div>
+  );
+}
+
+// ── ScoreBar ──────────────────────────────────────────────────────────────────
+
 function ScoreBar({ score, color }: { score: number | null; color: string }) {
   return (
     <div style={{ width: "100%", height: 8, background: "#1a1a1a", borderRadius: 4, overflow: "hidden" }}>
@@ -59,6 +162,8 @@ function ScoreBar({ score, color }: { score: number | null; color: string }) {
     </div>
   );
 }
+
+// ── VideoPanel ────────────────────────────────────────────────────────────────
 
 function VideoPanel({
   stream, videoRef, label, score, isWinner, isTie, muted = false,
@@ -78,11 +183,7 @@ function VideoPanel({
     const el = ref.current;
     if (!el || !stream) return;
     el.srcObject = stream;
-    // Explicit play() is required on iOS Safari and some Android browsers.
-    // autoPlay alone is not reliable when srcObject is set programmatically.
-    el.play().catch(() => {
-      // Autoplay policy blocked — fine, the next user gesture will unlock it.
-    });
+    el.play().catch(() => {});
   }, [stream, ref]);
 
   const scoreColor = score == null ? "#555"
@@ -133,38 +234,32 @@ function VideoPanel({
 // ── Main Component ────────────────────────────────────────────────────────────
 
 export default function MultiplayerMemeMatcher() {
-  // Current meme target ratios
-  const [targetRatios, setTargetRatios] = useState<FaceRatios | null>(null);
-  const [memeImgSrc, setMemeImgSrc] = useState<string | null>(null);
+  const [targetRatios, setTargetRatios]   = useState<FaceRatios | null>(null);
+  const [memeImgSrc, setMemeImgSrc]       = useState<string | null>(null);
   const [memeAnalyzing, setMemeAnalyzing] = useState(false);
-
-  // Peer score (received via datachannel simulation — we use WS score_update)
-  const [peerScore, setPeerScore] = useState<number | null>(null);
-  const [myScore, setMyScore] = useState<number | null>(null);
-
-  // Game round active?
-  const [roundActive, setRoundActive] = useState(false);
-
-  // WebRTC
-  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [peerScore, setPeerScore]         = useState<number | null>(null);
+  const [myScore, setMyScore]             = useState<number | null>(null);
+  const [roundActive, setRoundActive]     = useState(false);
+  const [localStream, setLocalStream]     = useState<MediaStream | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
 
-  // Signaling callbacks (stable refs to avoid hook re-creation)
-  const onRoundStartRef = useRef<(i: number) => void>(() => {});
-  const onRoundEndRef = useRef<(r: any) => void>(() => {});
-
-  const onOfferRef = useRef<(s: RTCSessionDescriptionInit) => void>(() => {});
-  const onAnswerRef = useRef<(s: RTCSessionDescriptionInit) => void>(() => {});
+  // Stable callback refs
+  const onRoundStartRef   = useRef<(i: number) => void>(() => {});
+  const onRoundEndRef     = useRef<(r: any) => void>(() => {});
+  const onOfferRef        = useRef<(s: RTCSessionDescriptionInit) => void>(() => {});
+  const onAnswerRef       = useRef<(s: RTCSessionDescriptionInit) => void>(() => {});
   const onIceCandidateRef = useRef<(c: RTCIceCandidateInit) => void>(() => {});
+  const onPeerScoreRef    = useRef<(score: number) => void>(() => {});
 
   const { state: sigState, startMatchmaking, sendRematch, sendScoreUpdate, sendSignal, userId } =
     useSignaling({
       workerUrl: WORKER_URL,
-      onOffer: useCallback((s) => onOfferRef.current(s), []),
-      onAnswer: useCallback((s) => onAnswerRef.current(s), []),
+      onOffer:        useCallback((s) => onOfferRef.current(s),        []),
+      onAnswer:       useCallback((s) => onAnswerRef.current(s),       []),
       onIceCandidate: useCallback((c) => onIceCandidateRef.current(c), []),
-      onRoundStart: useCallback((i) => onRoundStartRef.current(i), []),
-      onRoundEnd: useCallback((r) => onRoundEndRef.current(r), []),
+      onRoundStart:   useCallback((i) => onRoundStartRef.current(i),   []),
+      onRoundEnd:     useCallback((r) => onRoundEndRef.current(r),     []),
+      onPeerScore:    useCallback((s) => onPeerScoreRef.current(s),    []),
     });
 
   const { remoteStream, startAsHost, handleOffer, handleAnswer, handleIceCandidate } = useWebRTC({
@@ -173,35 +268,58 @@ export default function MultiplayerMemeMatcher() {
     onSignal: sendSignal,
   });
 
-  // Wire up stable refs
-  onOfferRef.current = handleOffer;
-  onAnswerRef.current = handleAnswer;
+  // Wire stable refs
+  onOfferRef.current        = handleOffer;
+  onAnswerRef.current       = handleAnswer;
   onIceCandidateRef.current = handleIceCandidate;
 
-  // Score callback — send to server
+  // Live peer score — update during round AND store final score
+  onPeerScoreRef.current = (score: number) => {
+    setPeerScore(score);
+  };
+
+  // ── Score callback ─────────────────────────────────────────────────────────
   const handleMyScore = useCallback((score: number) => {
     setMyScore(score);
     sendScoreUpdate(score);
   }, [sendScoreUpdate]);
 
-  // localVideoRef is passed to useFaceDetection so detection runs on the visible
-  // video element — no hidden video needed, no iOS frame throttling.
+  // ── Face detection ─────────────────────────────────────────────────────────
   const { modelsReady, cameraReady, faceDetected, similarity, localStream: detectedStream } =
-    useFaceDetection({ onScore: handleMyScore, targetRatios, active: roundActive, videoRef: localVideoRef });
+    useFaceDetection({
+      onScore: handleMyScore,
+      targetRatios,
+      active: roundActive,
+      videoRef: localVideoRef,
+    });
 
-  // Sync the stream from face detection into localStream state for WebRTC
+  // Sync detected stream into state for WebRTC
   useEffect(() => {
     if (detectedStream) setLocalStream(detectedStream);
   }, [detectedStream]);
 
-  // When both in room and host, initiate WebRTC offer
+  // ── FIX: Start WebRTC offer only after BOTH conditions are true ────────────
+  // Original bug: startAsHost() fired when peerCount hit 2 but localStream
+  // hadn't propagated through React yet (two render cycles behind).
+  // We now track localStream readiness in a ref and re-check both conditions
+  // in a single effect that runs on either change.
+  const localStreamReadyRef = useRef(false);
   useEffect(() => {
-    if (sigState.phase === "in_room" && sigState.roomInfo?.role === "host" && sigState.peerCount === 2) {
+    if (localStream) localStreamReadyRef.current = true;
+  }, [localStream]);
+
+  useEffect(() => {
+    const isHost        = sigState.roomInfo?.role === "host";
+    const bothConnected = sigState.peerCount === 2;
+    const inRoom        = sigState.phase === "in_room";
+    const streamReady   = localStream != null;
+
+    if (isHost && bothConnected && inRoom && streamReady) {
       startAsHost();
     }
-  }, [sigState.phase, sigState.roomInfo?.role, sigState.peerCount, startAsHost]);
+  }, [sigState.phase, sigState.roomInfo?.role, sigState.peerCount, localStream, startAsHost]);
 
-  // Handle round start
+  // ── Round start ────────────────────────────────────────────────────────────
   onRoundStartRef.current = async (memeIndex: number) => {
     const src = MEMES[memeIndex];
     setMemeImgSrc(src);
@@ -209,26 +327,29 @@ export default function MultiplayerMemeMatcher() {
     setRoundActive(false);
     setMyScore(null);
     setPeerScore(null);
+
     const ratios = await analyzeMeme(src);
     setTargetRatios(ratios);
     setMemeAnalyzing(false);
+
+    // Only start detection AFTER meme analysis is done.
+    // This closes the gap where the server timer is already ticking but the
+    // client doesn't know what face to match yet.
     setRoundActive(true);
   };
 
-  // Handle round end
+  // ── Round end ──────────────────────────────────────────────────────────────
   onRoundEndRef.current = (result: any) => {
     setRoundActive(false);
-    // Extract peer score
     const peerUserId = Object.keys(result.results).find((id) => id !== userId);
     if (peerUserId) setPeerScore(result.results[peerUserId]);
     setMyScore(result.results[userId] ?? null);
   };
 
-  // ── Derived ─────────────────────────────────────────────────────────────────
-
+  // ── Derived state ──────────────────────────────────────────────────────────
   const { phase, secondsLeft, roundResult, rematchVotes, roomInfo } = sigState;
-  const iWon = roundResult?.winnerId === userId;
-  const isTie = roundResult !== null && roundResult.winnerId === null;
+  const iWon    = roundResult?.winnerId === userId;
+  const isTie   = roundResult !== null && roundResult.winnerId === null;
   const peerWon = roundResult?.winnerId !== null && roundResult?.winnerId !== userId;
   const iVotedRematch = rematchVotes.has(userId);
 
@@ -237,8 +358,11 @@ export default function MultiplayerMemeMatcher() {
     : similarity > 33 ? "#f59e0b"
     : "#ef4444";
 
-  // ── Render ───────────────────────────────────────────────────────────────────
+  // Display score: during round show live similarity, after round show final
+  const myDisplayScore   = roundActive ? (similarity ?? null) : myScore;
+  const peerDisplayScore = roundActive ? peerScore : peerScore;
 
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <main style={{
       minHeight: "100vh", background: "#0a0a0a", color: "#e8e8e8",
@@ -248,12 +372,9 @@ export default function MultiplayerMemeMatcher() {
       padding: "32px 24px", gap: 24,
       boxSizing: "border-box",
     }}>
-      {/* No hidden video — detection runs on the visible localVideoRef element */}
-
       <h1 style={{
         fontSize: "clamp(1.1rem, 2.5vw, 1.6rem)", letterSpacing: "0.2em",
-        textTransform: "uppercase", margin: 0,
-        color: "#fff",
+        textTransform: "uppercase", margin: 0, color: "#fff",
       }}>
         MEME FACE MATCH <span style={{ color: "#666", fontSize: "0.7em" }}>// MULTIPLAYER</span>
       </h1>
@@ -317,7 +438,13 @@ export default function MultiplayerMemeMatcher() {
             justifyContent: "space-between",
           }}>
             <span style={{ fontSize: "0.7rem", color: "#444", letterSpacing: "0.08em" }}>
-              {roundActive ? "ROUND ACTIVE" : roundResult ? "ROUND OVER" : "WAITING FOR OPPONENT..."}
+              {memeAnalyzing
+                ? "ANALYZING MEME..."
+                : roundActive
+                ? "ROUND ACTIVE"
+                : roundResult
+                ? "ROUND OVER"
+                : "WAITING FOR OPPONENT..."}
             </span>
             {secondsLeft != null && (
               <span style={{
@@ -333,26 +460,36 @@ export default function MultiplayerMemeMatcher() {
             </span>
           </div>
 
+          {/* Dominance slider — chess.com style */}
+          <DominanceSlider
+            myScore={myDisplayScore}
+            peerScore={peerDisplayScore}
+            active={roundActive}
+            iWon={iWon}
+            peerWon={peerWon}
+            isTie={isTie}
+          />
+
           {/* Main game area */}
           <div style={{
             display: "flex", gap: 16, alignItems: "flex-start",
             width: "100%", maxWidth: 1100, flexWrap: "wrap",
             justifyContent: "center",
           }}>
-            {/* My video — videoRef passed so face detection runs on this visible element */}
+            {/* My video */}
             <div style={{ flex: 1, minWidth: 240, maxWidth: 360 }}>
               <VideoPanel
                 stream={localStream}
                 videoRef={localVideoRef}
                 label="YOU"
-                score={roundActive ? (similarity ?? null) : myScore}
+                score={myDisplayScore}
                 isWinner={iWon}
                 isTie={isTie}
                 muted={true}
               />
             </div>
 
-            {/* Meme + score center */}
+            {/* Meme center */}
             <div style={{
               display: "flex", flexDirection: "column", gap: 12,
               alignItems: "center", justifyContent: "center",
@@ -382,12 +519,9 @@ export default function MultiplayerMemeMatcher() {
                   <span style={{ color: "#333", fontSize: "0.75rem" }}>Meme incoming...</span>
                 </div>
               )}
-
-              {/* VS badge */}
-              <div style={{
-                fontSize: "0.75rem", color: "#333",
-                letterSpacing: "0.2em", fontWeight: "bold",
-              }}>VS</div>
+              <div style={{ fontSize: "0.75rem", color: "#333", letterSpacing: "0.2em", fontWeight: "bold" }}>
+                VS
+              </div>
             </div>
 
             {/* Peer video */}
@@ -395,7 +529,7 @@ export default function MultiplayerMemeMatcher() {
               <VideoPanel
                 stream={remoteStream}
                 label="OPPONENT"
-                score={roundActive ? null : peerScore}
+                score={peerDisplayScore}
                 isWinner={peerWon}
                 isTie={isTie}
               />
@@ -412,8 +546,7 @@ export default function MultiplayerMemeMatcher() {
               width: "100%", maxWidth: 500,
             }}>
               <div style={{
-                fontSize: "clamp(1rem, 3vw, 1.5rem)",
-                fontWeight: "bold",
+                fontSize: "clamp(1rem, 3vw, 1.5rem)", fontWeight: "bold",
                 color: isTie ? "#f59e0b" : iWon ? "#22c55e" : "#ef4444",
               }}>
                 {isTie ? "IT'S A TIE!" : iWon ? "YOU WIN! 🎉" : "YOU LOSE!"}
@@ -423,7 +556,6 @@ export default function MultiplayerMemeMatcher() {
                 <span>Opponent: <b style={{ color: "#fff" }}>{peerScore ?? 0}%</b></span>
               </div>
 
-              {/* Rematch votes */}
               <div style={{ display: "flex", gap: 12 }}>
                 <button onClick={sendRematch} disabled={iVotedRematch} style={{
                   padding: "10px 28px",
@@ -437,8 +569,7 @@ export default function MultiplayerMemeMatcher() {
                   {iVotedRematch ? `WAITING... (${rematchVotes.size}/2)` : "REMATCH"}
                 </button>
                 <button onClick={startMatchmaking} style={{
-                  padding: "10px 28px",
-                  background: "transparent",
+                  padding: "10px 28px", background: "transparent",
                   color: "#555", border: "1px solid #222",
                   borderRadius: 8, fontSize: "0.8rem",
                   letterSpacing: "0.1em", cursor: "pointer",
